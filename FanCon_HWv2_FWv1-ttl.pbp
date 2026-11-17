@@ -1,0 +1,740 @@
+'============================================================================
+' Variable Speed Fan Control (based on Jians ACPS)   
+' For board "AC Switching v0.4.2"                        Horizon 2021
+' Version 1 (based on ACPS version 5)
+' MCU PIC 18F26K22
+'============================================================================
+'
+' Inputs:
+' 1. One opto-coupled, digitized line AC signal for timing synchronization
+' 2. One DC converted Speed (pulses) converted to DC Voltage for %Duty schedule
+'     1023-Speedi is "Speed" = 329 with no RPM, increases to ~980 at High Speed
+' 3. Two buttons on "temp sensor" line as voltage divider
+' Buttons are nominally 1023, UP gives 680, DN gives 508 (with 3x 10k dividers)
+' They need a little Debounce so hitting DN doesn't trigger UP
+' Output:
+'       ^                  100% at S2 and above
+'  100% |.  .  .  .  .  .  .  _____________
+'       |                   /
+'Duty%  |                 /    Linear between S1 & S2
+'       |                /  
+' Duty1 | .  .  .  .   /  Jumps to Duty1 at S1
+'   0%  |______________|___________________> Speed
+'                      S1
+' 1. Triac (triggered low) triggered with phase adjusted from LATE (low current) 
+'	to EARLY (high current) to control current output to load
+' COMS: Sending Button, Speed and Duty via RTX line at 115200 baud
+'===========================================================================
+'
+'REVISIONS HISTORY
+'VER1 (VSFC) June 2021 Hz
+'Setup for Speed reading and %duty cycle lookup, Button control:
+'Long Push Set LOW speed, Set High Speed (to current speed)
+'Short Push: -/+ the minimum Duty cycle (Duty at LOW speed)
+'
+'============= STILL TO DO ========
+' Implement Manual mode to run fan var speed w/o speed input
+'
+'VER 5 (Arpl 2021, Hz)
+'Rev 4 had a problem (only on some boards?) where very low % loads would "roll over" to be 100%
+'This was apparently a problem with the initial Sync, 
+'  where it thought that the voltage was low (like 60V), and used these timings
+'  Which would cause the "rollover" to the next AC cycle at low % loads
+' To fix this I put in a 10 sync average of both F and V
+' It looks like it maby gets a bad F/V only like once in 100 starts, but now
+' With the averagaing, we should never see this. 
+'IF it synchs at 60V and runs at >120V it WILL have this rollover problem
+'
+'===========================================================================
+'configurations for clock,port,ADC
+portc.7=1           'Turn OFF Triac first!
+osccon = %11110110	'1xxx0110 (111=16MHz, 110=8MHz, 101=4MHz, 100=2MHz, 011=1MHz)
+define OSC 16
+
+trisa = %00000001 	'Set portx as 1:input or 0: output
+trisb = %10000001  
+trisc = %00001100
+
+ADCON0.0 = 1   		'enable ADC (analog to digital conversion)
+ADCON1 = %00000000  	'set Vref: 0000xxxx, Vref+ xx-00:Vdd,01:ext,10:FVR, Vref- xx-00:Vss,01:ext, 10:FVR
+
+define ADC_BITS 10
+ADCON2 = %10101101  	'bit 7=1: result right justified (10bits),0:left (8bits)
+                    	'bit 5-3: 101 = 12 TAD,001 = 2 TAD (ADC clock period)
+                    	'bit 2-0: TAD 001 = Fosc/8,101 = Fosc/16  
+ANSELA = %00000001  	'1: digital input buffer disabled (allows ADC) 
+ANSELB = %00000000
+ANSELC = %00001100
+
+porta = 0
+portb = 0     
+portc = %10000000    	'to off triac (portc.7) as soon as possible
+
+'INTERRUPT =====================================================================
+INCLUDE "DT_INTS-18_k22.bas"            'Add Instant Interrupt routine
+INCLUDE "ReEnterPBP-18.bas"             'Include if using PBP interrupts
+
+ASM
+INT_LIST  macro     ; IntSource,    Label,          Type,   ResetFlag?
+        INT_Handler     TMR3_INT,    _firingIR,       PBP,    	yes
+        INT_Handler     INT0_INT,    _zeroCrossIR,    PBP,    	yes
+        INT_Handler     TMR1_INT,    _cycleIR,        PBP,    	yes
+        INT_Handler     TMR5_INT,    _offIR,          PBP,      yes
+        ;INT_Handler     RX2_INT,    _rx2IR,          PBP,      yes
+    endm
+    INT_CREATE                          ; Creates the interrupt processor
+ENDASM
+@ INT_DISABLE INT0_INT
+
+'==============================================================================
+'Setup Timer0 to determine sense signal period
+
+'T0CON: Timer0 control register to enable and setup timer0
+'1xx1xxxx (x:1=8bit,0=16bit, x:1=transition on T0CKI pin, 0=internal clock,
+'           x:1=no prescaler,0=prescaler,
+'           xxx prescaler: 111=1:256, 110=1:128, 101=1:64, 100=1:32
+'             011=1:16, 010=1:8, 001=1:4, 000=1:2)
+' @16MHz , count every 1/4 clock, prescale 4 1us per count 
+T0CON = %10010001
+
+senseTmr  var T0CON.7
+sensetmr = 0 
+senseTmrH var TMR0H
+senseTmrL var TMR0L
+sensetmrh=0
+sensetmrl=0
+
+
+sensePin var portb.0
+
+senseHCount var word
+sensehcount = 0
+senseLCount var word
+senselcount = 0
+
+SLD var word
+SHD var word        'Just for display
+
+senseHLDelta var word
+sensehldelta = 0
+
+SenseDetermined var bit
+sensedetermined = 0
+
+frequency var byte
+voltage var byte
+
+'==============================================================================
+'Setup Int0 for sense line interrupt
+zeroCrossSenseIE var INTCON.4 
+
+ZeroCrossRising var INTCON2.6
+ZerocrossRising = 1		'INTCON2.6: 1 = INT0 interrupt on rising edge, 0 = on falling edge
+
+zeroCrossSenseIF var INTCON.1
+zerocrosssenseif = 0
+
+'==============================================================================
+'Setup Timer1 for cycleTimer
+
+'T1CON: Timer1 control register to enable and setup timer1
+'xxxx0011 (xx:00=tmr1 clock source is instruction clock(Fosc/4),01=Fosc
+'           xx:prescale,00=1:1,01=1:2,10=1:4,11=1:8,
+           'preload is manually tuned to give closest possible to secHasChanged = 1s
+                            
+T1CON = %00100011
+
+cycleTmrPreload var word       
+cycleTmrPreload = 0
+
+T1GCON = 0 			'timer1 counts regardless of gate function
+
+cycleTmrIE var PIE1.0 		'to enable timer1 overflow interrupt
+
+cycleTmrIF var PIR1.0      
+cycleTmrIF = 0  		'interrupt flag for Timer1
+cycleTmr var T1CON.0
+cycletmr = 0
+
+cycleTmrH var TMR1H
+cycleTmrL var TMR1L
+cycleTmrH = 0   		'Timer1 register, high byte
+cycleTmrL = 0   		'Timer1 register, low byte
+
+'==============================================================================
+'Setup Timer3 for firingTimer
+
+'T3CON: Timer3 control register to enable and setup timer3
+'xxxx0011 (xx:00=tmr1 clock source is instruction clock(Fosc/4)
+'           xx:prescale,00=1:1,01=1:2,10=1:4,11=1:8,
+T3CON = %00100011           
+
+firingTmrPreload var word 
+firingtmrpreload = 0     
+T3GCON = 0 			'timer3 counts regardless of gate function
+
+firingTmrIE var PIE2.1 		'to enable timer3 overlfow interrupt
+
+firingTmrIF var PIR2.1     
+firingTmrIF = 0  		'interrupt flag for Timer5
+firingTmr var T3CON.0
+firingtmr = 0
+
+firingTmrH var TMR3H
+firingTmrL var TMR3L
+firingTMRH = 0   		'Timer3 register, high byte
+firingTMRL = 0   		'Timer3 register, low byte
+
+'==============================================================================
+'Setup Timer5 for triac offTimer
+
+'T5CON: Timer5 control register to enable and setup timer5
+'xxxx0011 (xx:00=tmr1 clock source is instruction clock(Fosc/4)
+'           xx:prescale,00=1:1,01=1:2,10=1:4,11=1:8,
+T5CON = %00100011           
+
+offTmrPreload var word 
+offtmrpreload = 0     
+T5GCON = 0 			'timer5 counts regardless of gate function
+offTmrIE var PIE5.1 		'to enable timer3 overlfow interrupt
+
+offTmrIF var PIR5.1     
+offTmrIF = 0  			'interrupt flag for Timer5
+offTmr var T3CON.0
+offtmr = 0
+
+offTmrH var TMR5H
+offTmrL var TMR5L
+offTMRH = 0   			'Timer5 register, high byte
+offTMRL = 0   			'Timer5 register, low byte
+
+'==============================================================================================
+'Variable declarations and initialization
+
+ver	      var byte	         'Version of FW
+led       var porta.1       'status LED
+triac     var portc.7       'triac (triggered low)
+sense     var portb.0       'AC line phase sense (inversed)
+phaseMax  var word          'Phase max
+phase     var word          'Phase (read from pot)
+pPhase    var word          'Previous phase
+phaseCumulative var word    'Cumulative phase for average calculation
+phaseCumulativeCount var word
+dummy     var byte          'Dummy read from pot
+fact      var byte          'Factor
+arm       var bit           'Arm Triac (0=ARMED, 1= NOT ARMED)
+SpeedI      var word        'Inverted Speed Input
+Speed       var word
+S1          var word        'Speed 1 (ON fan)
+S2          var word        'Speed 2, 100% Duty
+ManDuty     var word        'Manual Duty Cycle
+ButIn       var word        'Analog reading of Buttons (nominally 340 o 680 if pushed)
+ButCnt1     var byte        'Count of cycles with Button 1 on
+ButCnt2     var byte        'Count with Button 2 on
+THyst       var word        'Hystorisis Time (in cycles) before allow OFF
+Duty1       var word        'Duty Cycle to start with
+MinSpd      var Word        'Minimum Speed (SPEED when no RPM input)
+MinCnt      var byte        'Counter to establish minimum SPEED
+deb         var bit         'Debounce ON
+
+read 0,S1.byte0             'Incase they're stored, read 'em
+Read 1,s1.byte1
+read 2,S2.byte0
+read 3,s2.byte1
+read 4,duty1.byte0
+read 5,duty1.byte1
+read 4,MinSpd.byte0
+read 5,MinSpd.byte1
+
+if S1=0 then S1 = 450                       'Speed to Start Fan (zreo speed is like 350)
+if s2=0 then S2 = 800                       'Full Power Speed (Max reading is like 970)
+if duty1=0 then Duty1 = 250                 'Start Duty
+if MinSpd = 0 then minspd= 330              'No RPM Speed Reading (Not used)
+
+ver=1			                            '1 byte is plenty
+phaseADC var word
+phaseadc = 0
+phaseADCPercent var byte
+phaseadcpercent = 0
+  
+phaseCh   con 14            'ADC channel for phase firing control. 15 in V0.4.3
+
+triggerDelayPreload var word
+halfCyclePreload    var word
+FirePreload         var word
+OnPreload           var word
+
+isFirstHalfCycle    var bit
+isFiring            var bit
+Vsync               var byte        '# of Voltage Sync measurments
+Fav                 var word        'Sum/Avg Freq
+Vav                 var word        'Sum/Agv Voltage
+
+isfiring = 0
+
+i   var word    	'Generic counter
+i=0
+                                    
+loopCount var word
+loopcount = 0
+
+triac = 1               'Turn it OFF (1=off)
+Phasemax = 255
+Phase = 255
+pPhase = 0
+phaseCumulative = 0
+phaseCumulativeCount = 0
+fact = 37
+
+
+'============================================================================
+'configurations to enable HSEROUT (serial communication)
+'serial 2 115200bps
+'baudrate based on 16MHhz clock
+
+TXSTA2=%00100100        'CSRC TX9 TXEN SYNC SENDB BRGH TRMT TX9D
+RCSTA2=%10010000        'SPEN RX9 SREN CREN ADDEN FERR OERR RX9D  
+BAUDCON2=%01111000      '01xxx000 - xx-00:TTL,11:RS232, BRG16 x-1:16bit,0:8bit 
+
+SPBRG2=34                    
+SPBRGH2=0                       
+
+serinIF2 var PIR3.bit5   'interrupt flag for serin2
+serinIE2 var PIE3.bit5   'serin2 interrupt enable bit
+serinE2 var RCSTA2.4     'serin2 enable bit
+serine2 = 1
+
+serinDump var byte
+
+hserout2 ["FocusAppliedTech Var Speed Fan Cntl V",#ver,13,10]
+Fav=0
+Vav=0
+Vsync=0
+
+'==============================================================================================
+'configuration of parameters through serin2
+numOfSerinChar con 20
+serinChar var byte[numofserinchar]
+serinCharLat var byte[numofserinchar]
+serinCharIndex var byte
+serinCharindex = 0
+serinCharLatIndex var byte
+serincharlatindex = 0
+
+isSerinCharEmpty var bit
+isserincharempty = 1
+isSerinCharReady var bit
+isserincharready = 0
+isInConfigMode var bit
+isinconfigmode = 0
+
+configIndex var byte
+configIndex = 0
+
+isConfigIndexError var bit
+isConfigIndexError = 0
+
+configTmr var byte
+configTmr = 0
+
+isSerinValueError var bit
+isserinvalueerror = 0
+isSerinValue var bit
+isserinvalue = 1
+
+serinValue var word
+serinvalue = 0
+
+serinValueMultiplier var word
+serinvaluemultiplier = 1
+VGood   var bit
+'=============================================================================
+
+INTCON = %11010000  'enable global and peripheral interrupt
+
+'===============================================================================
+'Program code start here:
+'determineSense: to determine voltage and frequency from the sense line
+'determineSense will decide on voltage and frequency from one AC cycle, then
+'code will loop in main:
+'main: Read Speed and calchulate % duty to drive triac
+
+
+@ INT_ENABLE INT0_INT
+determineSense:      '==========================Determine Sense ================
+    voltage=0
+    frequency=0
+    vgood=0
+    loopcount=loopcount+1
+    if loopcount//800=0 then			'// gives remainder of division
+        i=0					             'Toggles LED every 1500 loops  (SLOW)
+    endif
+
+    if loopcount//30=0 then
+        if i<ver then led=1-led              'Blink Revision number
+        if led=0 then i=i+1
+    endif
+    SLD = senseLcount
+    SHD = SenseHCount
+
+    if sensedetermined then
+        sensehldelta = sensehcount-senselcount
+        sensehldelta = sensehldelta/100
+        sensehcount = sensehcount/1000
+    
+        select case sensehcount
+           case 10,11,12
+                frequency = 50
+                if abs(sensehldelta-9)<=4 then
+                    voltage = 240
+                    vgood=1
+                elseif abs(sensehldelta-19)<=5 then
+                    voltage = 120
+                    Vgood=1
+                    elseif  abs(sensehldelta-36)<=11 then
+                     voltage = 60
+                    Vgood=1
+                else 
+                    voltage = 0
+                    'frequency = 0
+                endif    
+           case 8,9
+                frequency = 60
+                if abs(sensehldelta-7)<=4 then
+                    voltage = 240
+                    Vgood=1
+                elseif abs(sensehldelta-16)<=4 then
+                    voltage = 120
+                    Vgood=1
+                    elseif abs(sensehldelta-28)<=7 then
+                    voltage = 60
+                    Vgood=1
+                else 
+                    voltage = 0
+                    'frequency = 0
+                endif
+           case else
+                frequency = 0
+                voltage = 0
+        end select
+
+        if vgood=0  then                            'Not enough samples, so keep averaging
+            sensedetermined=0
+            @ INT_ENABLE INT0_INT
+        endif
+        sensehcount = 0
+        senselcount = 0
+    endif
+    
+        
+    hserout2 ["L:",#SLD,", "]
+    hserout2 ["H:",#SHD,", "]
+    hserout2 ["V:",#voltage,", "]
+    hserout2 ["F:",#frequency]
+    if vgood=1 then 
+        Fav=Fav+Frequency
+        Vav=Vav+Voltage
+        Vsync=Vsync+1
+        hserout2 [" -- Sync #",#Vsync]
+    endif
+    hserout2 [10,13]
+        
+    if vsync<10 then  goto determinesense       'Gotta sync 10 x to count
+
+    Fav=Fav/VSync
+    Vav=Vav/Vsync
+    
+    frequency=50
+    if Fav>55 then frequency = 60
+    Voltage=120
+    if Vav<80 then Voltage = 60
+    if Vav>160 then voltage = 240                   'Bias towards 240
+                                            
+    select case frequency				
+           case 50
+                halfcyclepreload = 65535 - 9950 	'9950us for half cycle
+                if voltage = 240 then					
+                   triggerdelaypreload = 65535 - 300 	'sense line triggered 300us earlier than zero
+                elseif voltage = 120 then                					
+                   triggerdelaypreload = 65535 - 633	'sense line triggered 633us earlier than zero
+                   elseif voltage = 60 then
+                   triggerdelaypreload = 65535 - 1260	'sense line triggered 1260us earlier than zero  (Guestimate)
+                endif
+           case 60
+                halfcyclepreload = 65535 - 8283 	'8283us for half cycle
+                if voltage = 240 then
+                   triggerdelaypreload = 65535 - 233	'sense line triggered 233us earlier than zero
+                elseif voltage = 120 then
+                   triggerdelaypreload = 65535 - 500    'sense line triggered 500us earlier than zero
+                 elseif voltage = 60 then
+                   triggerdelaypreload = 65535 - 1000    'sense line triggered 500us earlier than zero
+
+                endif
+           case else   
+                sensedetermined = 0			'keep in sensing mode if no expected volt/freq
+    end select
+
+
+
+hserout2 ["Synchronized! V:",#Vav,","]
+hserout2 ["F:",#Fav,","]
+hserout2 [10,13,10,13]
+
+HSEROUT2 ["But","Speed","Duty"]
+'===============================================================================
+'enable interrupts required to drive triac
+@ INT_ENABLE INT0_INT			'Incomming Line Voltage Sence
+@ INT_ENABLE TMR1_INT			'Cycle Timer
+@ INT_ENABLE TMR3_INT			'Triac Firing Timer (turning it ON)
+@ INT_ENABLE TMR5_INT			'Triac OFF timer
+'@ INT_ENABLE RX2_INT
+loopcount=0                             'Previously not set to zero causing "blip" of current at start
+phasecumulative =0
+phase=0                                 'Start at zero
+Main:       '========================================================== MAIN
+
+if loopcount//64=0 then				    'do every 64 loops
+    adcin phasech,Speedi                            'Inverted V Speed
+    adcin porta.0,butin                             'Read Cal buttons
+    
+	adcin portX.#,ttl                             'Read Cal buttons
+    'Make sure the above is actualy ANALOG, INPUT and work ing at 10 bit
+	'Defina all the new vars (TTL, DIA, SIA)
+	
+	speed=1023-speedi                               'Make speed = ~0-1023
+	
+	select case TTL
+	case is <51				'Assuming 10 bit5
+	  SIA=Speed1
+	  DIA=Duty1
+	  case is<102				'10%
+	  SIA=0
+	  DIA=Duty1
+	  case else
+	  SIA=0			'Or whatever zero speed gives
+	  DIA= (ttl-102)*(1023-duty1)/921+duty1
+	  end select
+	
+    select case speed
+    case is <SIA                                     'Below S1 were OFF
+        phaseadc=0
+    Case is  >S2                                    'Above S2 were 100%
+        Phaseadc=1023
+    Case else
+        Phaseadc=DIA+(1023-DIA)*(speed-SIA)/(S2-SIA)  'Between we interpolate
+    end select                                          'between Duty1 and 100%
+	
+	
+    if butin > 1000 then deb=0              'Debounce OFF
+    if butin>450 and butin<560 then         'DOWN button
+        DEB=1                               'Debounce ON
+        ButCnt1=butcnt1+1                   '
+        if butcnt1=5 then duty1=duty1-20
+        if duty1>1023 then duty1=0
+        if butCnt1=60 then                  'Long push 
+            s1=speed         'Set Lower Speed to current
+            if S1<S2 then S2=S1+100
+            write 0,S1.byte0
+            Write 1,S1.byte1
+            write 2,S2.byte0
+            Write 3,S2.byte1                'Save 'em to EEPROM
+            write 4,Duty1.byte0
+            write 5,duty1.byte1
+        endif
+    else
+        butcnt1=0
+    endif
+    if butin>640 and butin<720 then         'UP Button
+        butcnt2=butcnt2+1                   
+        if deb=0 and butcnt2=5 then duty1=duty1+20    'Pick 5th so we know
+        if duty1>1023 then duty1=1023                 'button is "steady" 
+        if butcnt2=60 then                  'IF got LONG button hit
+            s2=speed                        'Set UPPER speed to current
+            if S1>S2 then                   'Qualify to avoid "inversion"
+                if S2<100 then 
+                    S2=100
+                    S1=0
+                else
+                    S1=S2-100
+                endif
+            endif
+            write 0,S1.byte0
+            Write 1,S1.byte1
+            write 2,S2.byte0
+            Write 3,S2.byte1                 'Save 'em to EEPROM
+            write 4,Duty1.byte0
+            write 5,duty1.byte1
+
+        Endif
+    else
+        butcnt2=0
+    endif
+    
+    phasecumulative=phasecumulative+phaseadc		'Just averaging the % Load comand ADC in
+    phasecumulativecount = phasecumulativecount+1
+endif
+
+if loopcount//180=0 then				            'This updates current about every ~95ms
+   phase = phasecumulative/phasecumulativecount
+   phasecumulative=0
+   phasecumulativecount=0
+  
+   phaseadc = phase 
+   phaseadcpercent = phaseadc*10/101                    'large load (pwm) means earlier firing (not later)
+    
+   select case phase
+           case is < 513 
+                gosub halfcurvelinearization
+           case else
+                phase =  1023 - phase
+                gosub halfcurvelinearization
+                phase = 1023 - phase
+   end select
+    
+     
+   select case frequency				'Set up Trian firing timing: 
+        case 50						
+             FirePreload = 65535-(-9*phase+9207)	'phase=0, delay=9000us, phase=1023, delay=0us
+                 					'equation to have longer on period at larger phase:
+             OnPreload= 65535-(4*phase-65)		'phase=29 (min to fire triac), onPeriod=51us, phase=1023, onPeriod=4027us
+
+        case 60                 				
+             FirePreload = 65535-(-7*phase-3*phase/10+7468) 	'phase=0, delay=7468us, phase=1023, delay=0us
+                 						'equation to have longer on period at larger phase:
+                 						'phase=29 (min to fire triac), onPeriod=50us, phase=1023, onPeriod=3330us
+             OnPreload= 65535-(3*phase+3*phase/10-46)
+   end select
+
+   arm = 1-(phase>23)	      	  			'If Phase>2.0% (ie. 255-5/256) then ARM = 0 (ON), else ARM=1 (off)       
+   led = 1-led 				                'toggle led FAST when got line sensing
+
+   hserout2 [#ButIn, " ",#Speed," ", #phase,10,13]      'This is our only "ping" OUT
+endif  
+   
+loopcount=loopcount+1  
+                 
+goto main
+
+'==============================================================================
+'linearization of phase
+halfCurveLinearization:
+
+select case phase
+       case is < 61
+            lookup phase,[0,21,29,36,41,46,50,54,58,62,_
+                          65,68,71,74,77,80,82,85,87,90,_
+                          92,94,96,99,101,103,105,107,109,111,_
+                          113,114,116,118,120,122,123,125,127,128,_
+                          130,132,133,135,137,138,140,141,143,144,_
+                          146,147,149,150,151,153,154,156,157,158,160],phase
+       case is < 101
+            phase = phase * 12/10 + 88
+       case is < 191
+            phase = phase * 92/100 + 117
+       case is < 281
+            phase = phase * 76/100 + phase * 4/1000 + 146
+       case is <= 512
+            phase = phase * 65/100 + phase * 8/1000 + 176
+end select
+
+return
+
+'==============================================================================
+zeroCrossIR:
+   
+   if !sensedetermined then
+      sensetmr = 0
+      
+      'if both senseHigh and senseLow has count, complete cycle has been detected
+      if sensehcount and senselcount then
+         sensedetermined = 1
+         'change the sensing to rising edge
+         ZeroCrossRising = 1
+         @ INT_DISABLE INT0_INT
+      
+      'if senseHigh has count, the sensing period must be for senseLow 
+      elseif sensehcount  then
+         senselcount.byte0 = sensetmrl
+         senselcount.byte1 = sensetmrh
+         sensetmrh = 0
+         sensetmrl = 0
+         sensetmr = 1
+         ZeroCrossRising=0
+      
+      'if waiting for falling edge, the sensing period is for senseHigh
+      elseif !ZeroCrossRising then
+         sensehcount.byte0 = sensetmrl
+         sensehcount.byte1 = sensetmrh
+         sensetmrh = 0
+         sensetmrl = 0
+         sensetmr = 1
+         ZeroCrossRising = 1
+      
+      'if both senseHigh and senseLow has no count, then start the sensing period timer
+      elseif !sensehcount and !senselcount then
+         sensetmrh = 0
+         sensetmrl = 0
+         sensetmr = 1
+         'the starting sensing is on rising edge, so change the sensing to falling edge to get the senseHigh period count
+         ZeroCrossRising = 0
+      endif
+   
+   'once SenseDetermined = 1,run here for firing triac
+   else
+       'sensing is earlier than actual zero crossing 
+       'so wait "triggerDelay" which will trigger "cycleIR" for actual start of cycle           
+       cycletmrh = triggerdelaypreload.byte1
+       cycletmrl = triggerdelaypreload.byte0
+       cycletmr = 1
+       'first half cycle is triggered by zero crossing sensing.
+       'need isFirstHalfCycle to trigger a timer that will interrupt at start of second half cycle
+       isfirsthalfcycle = 1
+       led = 1-led      'toggle led at fast pace to indicate AC sensed 
+       zerocrosssenseif = 0
+    endif
+@ INT_RETURN
+
+'==============================================================================
+cycleIR:
+   'wait "firingDelay" depending on phase read from pot
+   'end of the wait will trigger "firingIR" that will actually turn on triac
+   firingtmrh = FirePreload.byte1
+   firingtmrl = FirePreload.byte0
+   firingtmr = 1
+   cycletmr = 0
+   
+   'if this is the firstHalfCycle, then set a timer to interrupt at start of second half cycle
+   'if this is second half cycle, then will wait for zero crossing sensing to start a new cycle
+   if isfirsthalfcycle then
+      cycletmrh = halfcyclepreload.byte1
+      cycletmrl = halfcyclepreload.byte0
+      cycletmr = 1
+      isfirsthalfcycle = 0
+   endif
+@ INT_RETURN 
+
+'==============================================================================   
+firingIR:
+
+   triac = arm 'turn on triac (if arm=1, triac won't turn on)
+   'set timer to turn off triac after onPeriod, which will trigger "offIR"
+   offtmrh = onpreload.byte1
+   offtmrl = onpreload.byte0
+   offtmr = 1
+   firingtmr = 0
+@ INT_RETURN
+
+'==============================================================================   
+offIR:
+   triac = 1 'turn off triac (active low)
+   offtmr = 0
+@ INT_RETURN
+
+''==============================================================================
+'rx2IR:
+'    serinchar[serincharindex] = RCREG2
+'    hserout2 [serinchar[serincharindex]]
+'    serincharindex = serincharindex + 1
+'    configtmr = 20
+'@ INT_RETURN
+

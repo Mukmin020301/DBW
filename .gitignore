@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PicBasic Pro & MPASM compiler intermediate files
+*.LST
+*.MAC
+*.O
+*.ERR
+
+# Temporary diagnostic & scratch files
+*.ps1
+check_steps.py
+print_user_msgs.py
+pdf_text.txt
+*.png
+crop_*.jpg
+bot_*.jpg
+photo_0.jpg
+q_all.jpg
+zoom_q1.jpg
+highres_q1.jpg
+rigol_screen.jpg
+scope_scale.jpg
+scope_wave.jpg
+board_top_fullres.jpg
+tb_*.jpg

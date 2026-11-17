@@ -1,0 +1,157 @@
+'****************************************************************
+'*  Name    : DBW_SERVO_YANMAR.BAS                              *
+'*  Author  : Horizon / Focus Applied Technologies (c) 2026      *
+'*  Target  : Fuel Stretcher V2.0 (MCU PIC 18F46K22 @ 16MHz)    *
+'*  Reads 0-5V TPS from Dyno/Potentiometer (AN24 / PORTD.4)     *
+'*  Outputs 50Hz RC PWM signal on:                              *
+'*    - Inj01 (PORTD.1 - Green Wire)                            *
+'*    - Inj02 (PORTC.2 - White Wire)                            *
+'*  Drives Tower Pro MG995R Servo for Yanmar L48 Throttle       *
+'*  Fixed 16-Bit Integer Math Scaling (Zero Rollover/Jitter)   *
+'*  High-Speed Scope Telemetry @ 115200 Baud (COM4)             *
+'****************************************************************
+'DECLARATION *******************************************************************
+'18F46K22 Controller
+'OSCILLATOR=====================================================================
+OSCCON=%01110111                        'IDLEN IRCF<2:0> OSTS HFIOFS SCS<1:0> set to Fosc=16MHz
+define OSC 16
+DEFINE ADC_BITS 8                       'software setting: 0-255 for 0-5V
+DEFINE ADC_CLOCK 3                      'ADC clock source: internal RC
+DEFINE ADC_SAMPLEUS 50                  'ADC sample time 50 microseconds
+
+'I/O CONFIG=====================================================================
+ANSELA = %00000000                      'All digital
+TRISA  = %11111111                      'Inputs
+
+ANSELB = %00000000                      
+TRISB  = %11111111
+
+ANSELC = %00000000                      'Digital I/O
+TRISC  = %10111011                      'PORTC.2 (Inj02) output, RX1/TX1 serial
+
+ANSELD = %00010000                      'ANSD4 (AN24 TPS) analog input (Bit 4 = 1)
+TRISD  = %11111001                      'PORTD.1 (Inj01) output (Bit 1 = 0), PORTD.2 (LED1) output (Bit 2 = 0)
+
+'HSERCOM Setup @ 115200 Baud (16MHz, BRGH=1, BRG16=1, SPBRG=34) ================
+TXSTA1=%00100100                        'TX enabled, BRGH=1
+RCSTA1=%10010000                        'SPEN=1, CREN=1
+BAUDCON1=%01001000                      'BRG16=1
+SPBRG1=34                               '115200 baud @ 16MHz (-0.79% error)
+SPBRGH1=0
+
+'PORT MAPPING & VARIABLES=======================================================
+ServoPin1       var PORTD.1             'Inj01 to Servo Signal (Green Wire)
+ServoPin2       var PORTC.2             'Inj02 to Servo Signal (White Wire)
+LED1            var PORTD.2             'Heartbeat LED
+RC1IF           var PIR1.5              'Hardware UART Receive Flag (1=Byte available)
+
+i               var byte                'counter
+s               var byte                'String character from serial
+t               var word                'Timer counter for LED blink
+tps             var word                'Raw ADC input (0-255)
+tpsav           var word                'Filtered TPS (running average)
+th              var word                'Servo Pulse Width (2.5us per count)
+span            var word                'Span = Phi - Plo
+Plo             var word                'Min Servo pulse (Idle stop)
+Phi             var word                'Max Servo pulse (WOT stop)
+num             var word                'Serial number accumulator
+cyc             var word                'Power cycles
+
+'EEPROM=========================================================================
+'    Plo(400)     Phi(800)      cyc(0)
+'    400=$0190    800=$0320
+data 1,144,       3,32,         0,0
+
+'INITIALIZATION*****************************************************************
+clear                                   'CLEAR ALL VARIABLES
+read 0,Plo.byte1                         'Read values from EEprom
+read 1,Plo.byte0
+read 2,Phi.byte1 
+read 3,Phi.byte0
+read 4,cyc.byte1
+read 5,cyc.byte0
+cyc=cyc+1                               'Increment number of power cycles and write
+write 4,cyc.byte1
+write 5,cyc.byte0
+
+'Sanity check EEPROM limits (400 = 1.0ms, 800 = 2.0ms standard RC servo)
+if (Plo < 300) or (Plo > 600) then Plo = 400
+if (Phi < 500) or (Phi > 900) then Phi = 800
+if Plo >= Phi then Plo = 400 : Phi = 800
+
+th = Plo
+
+for i=1 to 4
+    led1=1:pause 80
+    led1=0:pause 80
+next i
+
+Hserout ["# STARTUP Plo=", #Plo, " Phi=", #Phi, 13, 10]
+
+Main:'**************************************************************************
+    'Dynamic heartbeat LED proportional to TPS
+    t=t+1
+    if t>tpsav then led1=0
+    if t=200 then t=0:led1=1
+
+    '1. Sample Analog input (AN24 / PORTD.4)
+    adcin 24, tps
+
+    '2. Horizon running average filter
+    tpsav = (3 * tpsav + tps) / 4
+
+    '3. Scaled linear interpolation WITHOUT 16-bit word overflow
+    '   Formula: span = (Phi - Plo)
+    '   th = Plo + (span / 5) * tpsav / 51
+    '   Max intermediate product: (400/5) * 255 = 80 * 255 = 20,400 (< 65,535)
+    span = Phi - Plo
+    th = Plo + ((span / 5) * tpsav) / 51
+
+    '4. Constrain within safety limits
+    if th < Plo then th = Plo
+    if th > Phi then th = Phi
+
+    '5. Generate active-high 50Hz RC pulse on Inj01 (Green wire) & Inj02 (White wire)
+    pulsout ServoPin1, th               'Takes ~1.0ms to 2.0ms
+    pulsout ServoPin2, th
+
+    '6. Stream compact scope data @ 115200 baud (~0.8ms transmission time)
+    '   Format: <TPS_0_to_255>,<PULSE_MICROSECONDS>\r\n
+    Hserout [#tpsav, ",", #(th * 5 / 2), 13, 10]
+
+    '7. Complete precise 20.0ms frame (1.5ms pulse + 1.5ms pulse + 0.8ms serial + 16ms = ~20ms / 50Hz)
+    pause 16
+
+    '8. Non-blocking serial command check
+    if RC1IF = 1 then
+        Hserin 0, BAU, [s]
+        num = 0
+        Hserout ["# MENU: Current L=", #Plo, ", H=", #Phi, 13, 10]
+        GetChar:
+        Hserin 10000, BAU, [s]
+        HSEROUT [s]
+        if s="Q" then goto BAU
+        if s>47 and s<=59 then 
+            num = num*10 + s - 48
+            goto GetChar
+        endif
+        select case s
+        case "L"
+            if (num >= 300) and (num <= 650) then Plo = num
+            num = 0
+        case "H"
+            if (num >= 500) and (num <= 850) and (num > Plo) then Phi = num
+            num = 0
+        case "Z"
+            write 0, Plo.byte1 : write 1, Plo.byte0
+            write 2, Phi.byte1 : write 3, Phi.byte0
+            HSEROUT ["# BURNED", 13, 10]
+            goto BAU
+        case "Q"
+            goto BAU    
+        end select
+        goto GetChar
+        BAU:
+    endif
+
+goto Main

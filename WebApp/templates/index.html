@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hilux DBW Test Bench</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="dashboard">
+        <header>
+            <h1>Hilux 2KD-FTV DBW Test Bench</h1>
+            <p class="subtitle">Advantech USB-4716 Interface Dashboard</p>
+            <div id="daqStatusBadge" class="status-badge disconnected">Checking DAQ...</div>
+        </header>
+
+        <main class="grid-container">
+            <!-- Throttle Control Section -->
+            <section class="card throttle-card">
+                <h2>Dyno Throttle Input</h2>
+                <div class="slider-container">
+                    <input type="range" id="throttleSlider" min="0" max="5" step="0.01" value="0">
+                    <div class="voltage-display">
+                        <span id="throttleValue">0.00</span><span class="unit">V</span>
+                    </div>
+                    <p class="status-text">Simulating AO to Fuel Stretcher Board</p>
+                </div>
+            </section>
+
+            <!-- TPS Readings Section -->
+            <section class="card tps-card">
+                <h2>TPS Output Readings</h2>
+                <div class="gauges">
+                    <div class="gauge">
+                        <h3>TPS 1</h3>
+                        <div class="value"><span id="tps1Value">0.00</span><span class="unit">V</span></div>
+                    </div>
+                    <div class="gauge">
+                        <h3>TPS 2</h3>
+                        <div class="value"><span id="tps2Value">0.00</span><span class="unit">V</span></div>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="tpsChart"></canvas>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>
