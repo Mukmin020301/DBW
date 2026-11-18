@@ -2,8 +2,9 @@
 '*  Name    : DBW_SERVO_YANMAR.PBP                              *
 '*  Author  : Focus Applied Technologies / Horizon (c) 2026      *
 '*  Target  : Fuel Stretcher V2.0 (PIC18F46K22 @ 16MHz)         *
-'*  Purpose : Pure 50Hz RC Servo Throttle for Yanmar L48        *
+'*  Purpose : Full 0-180 Deg RC Servo Throttle for Yanmar L48   *
 '*  Output  : Inj01 (PORTD.1) Only - Zero Serial Overhead       *
+'*  Range   : 500us (0 Deg / Idle) to 2500us (180 Deg / WOT)    *
 '****************************************************************
 
 'OSCILLATOR & COMPILER CONFIG===================================
@@ -36,16 +37,17 @@ LED1        var PORTD.2         'Heartbeat LED
 tps         var word            'Raw ADC reading (0-255)
 tpsav       var word            'Filtered TPS
 tpsold      var word            'Previous TPS for deadband check
-th          var word            'Servo Time High (400=1ms, 800=2ms)
-span        var word            'Calibration span (Phi - Plo)
-Plo         var word            'Idle pulse width (400 = 1000us)
-Phi         var word            'WOT pulse width (800 = 2000us)
+th          var word            'Servo Time High (200=500us, 1000=2500us)
+span        var word            'Calibration span (Phi - Plo = 800)
+Plo         var word            'Idle pulse width (200 = 500us / 0 Deg)
+Phi         var word            'WOT pulse width (1000 = 2500us / 180 Deg)
 diff        var word            'Absolute difference for deadband
 i           var byte            'Counter for startup blink
 
 'EEPROM CALIBRATION DEFAULTS====================================
-'Plo = 400 (1.0ms Idle), Phi = 800 (2.0ms WOT)
-data 1,144, 3,32
+'Plo = 200 (500us / 0.5ms Idle), Phi = 1000 (2500us / 2.5ms WOT)
+'200 = $00C8 (0, 200), 1000 = $03E8 (3, 232)
+data 0,200, 3,232
 
 'INITIALIZATION==================================================
 clear
@@ -54,10 +56,12 @@ ServoPin = 0                    'Ensure servo signal starts at LOW (0V)
 read 0, Plo.byte1 : read 1, Plo.byte0
 read 2, Phi.byte1 : read 3, Phi.byte0
 
-'Sanity check EEPROM limits
-if (Plo < 300) or (Plo > 600) then Plo = 400
-if (Phi < 500) or (Phi > 900) then Phi = 800
-span = Phi - Plo
+'Sanity check EEPROM limits for MG995 0-180 degree stroke
+if (Plo < 150) or (Plo > 400) then Plo = 200
+if (Phi < 700) or (Phi > 1100) then Phi = 1000
+if Plo >= Phi then Plo = 200 : Phi = 1000
+
+span = Phi - Plo                '800 counts = 2000us span
 th = Plo
 
 'Power-up startup LED blink
@@ -89,8 +93,10 @@ Main:
     endif
 
     '3. Scaled pulse calculation (Overflow-safe 16-bit math)
-    '   th = Plo + (span / 5) * tpsav / 51
-    '   Max intermediate product: (400 / 5) * 255 = 20,400 (< 65,535)
+    '   span = 800 -> span / 5 = 160
+    '   Max intermediate product: 160 * 255 = 40,800 (< 65,535)
+    '   At tpsav = 0   -> th = Plo = 200 (500us / 0 Deg)
+    '   At tpsav = 255 -> th = Plo + 800 = 1000 (2500us / 180 Deg)
     th = Plo + ((span / 5) * tpsav) / 51
 
     '4. Constrain within calibrated limits
@@ -98,7 +104,7 @@ Main:
     if th > Phi then th = Phi
 
     '5. Generate Active-HIGH 50Hz RC pulse on Inj01 (PORTD.1) ONLY
-    '   Each count = 2.5us at 16MHz (400 = 1000us, 800 = 2000us)
+    '   Each count = 2.5us at 16MHz (200 = 500us, 1000 = 2500us)
     pulsout ServoPin, th
 
     '6. Heartbeat LED proportional to throttle activity
